@@ -1,0 +1,220 @@
+---
+version: 2.1
+
+orbs:
+  sonarcloud: sonarsource/sonarcloud@1.0.3
+  aws-cli: circleci/aws-cli@2.1.0
+  aws-ecr: circleci/aws-ecr@7.2.0
+  aws-ecs: circleci/aws-ecs@2.2.1
+  jira: circleci/jira@1.3.1
+
+executors:
+  default:
+    resource_class: large
+    environment:
+      NODE_OPTIONS: --max_old_space_size=8192
+    docker:
+      - image: cimg/node:17.7.2
+    working_directory: ~/workspace
+
+references:
+  restore_dependencies_cache: &restore_dependencies_cache
+    restore_cache:
+      keys:
+        - dependencies-{{ checksum "package_cache.json" }}
+        - dependencies-
+
+  restore_source_cache: &restore_source_cache
+    restore_cache:
+      keys:
+        - source-{{ .Branch }}-{{ .Revision }}
+        - source-{{ .Branch }}-
+
+  generate_dependencies_cache_checksum: &generate_dependencies_cache_checksum
+    run:
+      name: Dependencies cache checksum
+      command: |
+        cat package.json > package_cache.json
+        cat packages/app/package.json >> package_cache.json
+        cat packages/pwa/package.json >> package_cache.json
+
+commands:
+  restore-source-checksum-cache:
+    description: "This command will restore the source code from cache"
+    steps:
+      - *restore_source_cache
+      - run: git checkout -- .
+      - *generate_dependencies_cache_checksum
+      - *restore_dependencies_cache
+
+jobs:
+  bootstrap:
+    executor: default
+    steps:
+      - checkout
+      - run: git gc
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - '.git'
+      - run: git checkout -- .
+      - *generate_dependencies_cache_checksum
+      - *restore_dependencies_cache
+
+      - run:
+          name: Bootstrap
+          command: |
+            yarn bootstrap            
+
+      - save_cache:
+          key: dependencies-{{ checksum "package_cache.json" }}
+          paths:
+            - 'node_modules'
+            - 'packages/app/node_modules'
+            - 'packages/pwa/node_modules'
+
+  code-lint:
+    executor: default
+    steps:
+      - restore-source-checksum-cache
+      - run:
+          name: Lint
+          command: yarn lint
+
+  unit-test:
+    executor: default
+    description: "This command will run the unit tests"
+    steps:
+      - restore-source-checksum-cache
+      - run:
+          name: Run tests
+          command: yarn test
+
+  sonar:
+    executor: default
+    description: "This command will run the sonar analysis"
+    steps:
+      - checkout
+      - sonarcloud/scan
+
+  build:
+    executor: default
+    environment:
+      CI: false
+    steps:
+      - restore-source-checksum-cache
+      - run:
+          name: Build
+          command: yarn build
+
+  update-ecs-service:
+    docker:
+      - image: 'cimg/python:3.9.1'
+    steps:
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY_ID
+          aws-region: AWS_DEFAULT_REGION
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+      - run:
+          command: |
+            ECS_TASK_FAMILY="hello-world-app"
+            ECS_SERVICE="hello-world-service"
+            ECS_CLUSTER="example-cluster"
+            NEW_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/devops:latest"
+            
+            TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition "${ECS_TASK_FAMILY}" --region "${AWS_REGION}")
+            NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$NEW_IMAGE" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+            TASK_REVISION=$(aws ecs register-task-definition --region "${AWS_REGION}" --cli-input-json "$NEW_TASK_DEFINTIION" | jq -r '.taskDefinition.revision')
+            TASK=$(aws ecs list-tasks --cluster "${ECS_CLUSTER}" --desired-status RUNNING | jq '.taskArns[0]' | tr -d '"')
+            TASK_ID="${TASK##*/}"                           
+            aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --task-definition "${ECS_TASK_FAMILY}:${TASK_REVISION}" --desired-count 1
+            aws ecs stop-task --cluster "${ECS_CLUSTER}" --task ${TASK_ID}            
+
+commit-workflow-filters: &commit-workflow-filters
+  branches:
+    only:
+      - /feature\/.*/
+      - develop
+      - master
+      - main
+release-workflow-filters: &release-workflow-filters
+  branches:
+    only:
+      - /release\/.*/
+
+workflows:
+  version: 2
+  commit-workflow:
+    jobs:
+      - bootstrap:
+          filters: *commit-workflow-filters
+      - code-lint:
+          context: SonarCloud
+          requires:
+            - bootstrap
+          post-steps:
+            - jira/notify:
+                environment_type: testing
+                job_type: deployment
+          filters: *commit-workflow-filters
+      - unit-test:
+          context: SonarCloud
+          name: unit-test
+          requires:
+            - bootstrap
+          post-steps:
+            - jira/notify:
+                environment_type: testing
+                job_type: deployment
+          filters: *commit-workflow-filters
+      - sonar:
+          context: SonarCloud
+          requires:
+            - bootstrap
+          post-steps:
+            - jira/notify:
+                environment_type: testing
+                job_type: deployment
+          filters: *commit-workflow-filters
+      - build:
+          context: SonarCloud
+          requires:
+            - sonar
+            - unit-test
+            - code-lint
+          post-steps:
+            - jira/notify:
+                environment_type: testing
+                job_type: deployment
+          filters: *commit-workflow-filters
+
+  release-workflow:
+    jobs:
+      - bootstrap:
+          filters: *release-workflow-filters
+      - aws-ecr/build-and-push-image:
+          context: SonarCloud
+          name: build-image
+          create-repo: true
+          dockerfile: Dockerfile
+          no-output-timeout: 20m
+          profile-name: devops-007
+          repo: devops
+          skip-when-tags-exist: false
+          tag: 'latest,001'
+          requires:
+            - bootstrap
+          post-steps:
+            - jira/notify:
+                environment_type: production
+                job_type: deployment
+          filters: *release-workflow-filters
+      - update-ecs-service:
+          context: SonarCloud
+          requires:
+            - build-image
+          post-steps:
+            - jira/notify:
+                environment_type: production
+                job_type: deployment
+          filters: *release-workflow-filters
